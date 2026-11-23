@@ -179,6 +179,44 @@
 #define COL_TAG        0xFF3A7D5C
 #define COL_DANGER     0xFFB5443B
 
+/* --------------------------------------------------- editor document -------
+ * struct edit_doc layout, shared by edit.S, store.S and the UI. The offsets
+ * are asserted by the tests, so a layout change must be made here first.
+ */
+#define DOC_BUF       0x00
+#define DOC_CAP       0x08
+#define DOC_LEN       0x10
+#define DOC_CPS       0x18
+#define DOC_CURSOR    0x20
+#define DOC_ANCH      0x28
+#define DOC_DIRTY     0x30
+#define DOC_SELECTING 0x38
+#define DOC_BURST     0x40   /* end offset of the live typing burst, or -1 */
+#define DOC_UNC       0x48
+#define DOC_UNP       0x50
+#define DOC_UENT      0x58
+#define DOC_UNMAX     0x60
+#define DOC_UARENA    0x68
+#define DOC_UACAP     0x70
+#define DOC_UAN       0x78
+#define DOC_GOALCOL   0x80   /* remembered column for vertical moves          */
+#define DOC_GOALSET   0x88   /* cursor offset the goal was measured at, or -1  */
+#define EDIT_DOC_SIZE 0x90
+
+/* undo entry layout (DOC_UENT points at an array of these) */
+#define UNDO_OFF      0x00
+#define UNDO_INSLEN   0x08
+#define UNDO_DELLEN   0x10
+#define UNDO_INSPTR   0x18
+#define UNDO_DELPTR   0x20
+#define UNDO_SIZE     0x28
+
+/* editor command results */
+#define EDIT_OK         0
+#define EDIT_ERR_FULL  -1
+#define EDIT_ERR_RANGE -2
+#define EDIT_ERR_CP    -3
+
 /* ---------------------------------------------------------------- Sizes ---- */
 #define MAX_NOTES        512
 #define MAX_FOLDERS      64

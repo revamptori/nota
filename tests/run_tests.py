@@ -22,7 +22,7 @@ from elftools.elf.elffile import ELFFile                # noqa: E402
 CC = os.environ.get("NOTA_CC", "zig cc -target aarch64-linux-android").split()
 BUILD = os.path.join(ROOT, "build", "tests")
 
-SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S"]          # flat-testable modules (no bionic calls)
+SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S", "src/edit.S"]          # flat-testable modules (no bionic calls)
 TESTS = []
 
 
@@ -429,6 +429,371 @@ def test_sys_write_file_sync_failure_keeps_old(fx):
     n = s32(fx.call("nota_write_file_sync", taddr, faddr, fx.cstr(b"NEW"), 3))
     assert n < 0, n
     assert k.files["/data/nota/a.dat"] == b"OLD CONTENT"
+
+
+# ------------------------------------------------------------------ edit ----
+DOC_SIZE = 0x90
+DOC_BUF, DOC_CAP, DOC_LEN, DOC_CPS = 0x00, 0x08, 0x10, 0x18
+DOC_CURSOR, DOC_ANCH, DOC_DIRTY, DOC_SELECTING = 0x20, 0x28, 0x30, 0x38
+DOC_BURST, DOC_UNC, DOC_UNP = 0x40, 0x48, 0x50
+
+
+class Doc:
+    """A document bound to real editor memory in the interpreter."""
+
+    UENT_MAX = 64
+    ARENA = 8192
+
+    def __init__(self, fx, cap=256, text=b""):
+        self.fx = fx
+        self.cap = cap
+        self.buf = fx.alloc(cap)
+        self.doc = fx.alloc(DOC_SIZE)
+        self.uent = fx.alloc(0x28 * self.UENT_MAX)
+        self.arena = fx.alloc(self.ARENA)
+        fx.call("nota_doc_init", self.doc, self.buf, cap)
+        fx.call("nota_doc_init_undo", self.doc, self.uent, self.UENT_MAX,
+                self.arena, self.ARENA)
+        if text:
+            self.set_text(text)
+
+    def _ld(self, off):
+        return int.from_bytes(self.fx.read(self.doc + off, 8), "little")
+
+    def _st(self, off, v):
+        self.fx.m.store_mem(self.doc + off, (v & (2**64 - 1)).to_bytes(8, "little"))
+
+    text = property(lambda self: self.fx.read(self.buf, self._ld(DOC_LEN)))
+    length = property(lambda self: self._ld(DOC_LEN))
+    cps = property(lambda self: self._ld(DOC_CPS))
+    cursor = property(lambda self: self._ld(DOC_CURSOR))
+    anchor = property(lambda self: self._ld(DOC_ANCH))
+    dirty = property(lambda self: self._ld(DOC_DIRTY))
+
+    def set_text(self, text):
+        addr = self.fx.cstr(text)
+        self.fx.call("nota_doc_set_text", self.doc, addr, len(text))
+        return self
+
+    def insert(self, text):
+        return self.fx.call("nota_doc_insert", self.doc, self.fx.cstr(text),
+                            len(text))
+
+    def insert_cp(self, cp):
+        return fx_s32(self.fx.call("nota_doc_insert_cp", self.doc, cp))
+
+    def replace(self, start, end, text=b""):
+        addr = self.fx.cstr(text) if text else 0
+        return fx_s32(self.fx.call("nota_doc_replace", self.doc, start, end,
+                                   addr, len(text)))
+
+    def backspace(self):
+        return self.fx.call("nota_doc_backspace", self.doc)
+
+    def delete_forward(self):
+        return self.fx.call("nota_doc_delete_forward", self.doc)
+
+    def select(self, anchor, cursor):
+        self._st(DOC_ANCH, anchor)
+        self._st(DOC_CURSOR, cursor)
+
+    def move(self, off, extend=0):
+        self.fx.call("nota_doc_move", self.doc, off, extend)
+
+    def undo(self):
+        return self.fx.call("nota_doc_undo", self.doc)
+
+    def redo(self):
+        return self.fx.call("nota_doc_redo", self.doc)
+
+
+def fx_s32(v):
+    return s32(v)
+
+
+@test
+def test_edit_init_and_set_text(fx):
+    d = Doc(fx, 64)
+    assert d.text == b"" and d.length == 0 and d.cps == 0
+    d.set_text(b"hello")
+    assert d.text == b"hello"
+    assert d.length == 5 and d.cps == 5
+    assert d.cursor == 5 and d.dirty == 0
+    # UTF-8 counting: 1+2+3+4 bytes = 4 code points
+    d.set_text("a\u00e9\u20ac\U0001F600".encode())
+    assert d.cps == 4
+    assert d.text == "a\u00e9\u20ac\U0001F600".encode()
+
+
+@test
+def test_edit_capacity_truncation(fx):
+    d = Doc(fx, 16)
+    d.set_text(b"0123456789ABCDEFGHIJ")     # 20 bytes into a 16-byte buffer
+    assert d.length == 15, d.length          # cap - 1
+    assert d.text == b"0123456789ABCDE"
+    # truncation must not split a multi-byte sequence: with a 14-byte
+    # buffer, 15 bytes of input cut at 13 would land inside the euro
+    d2 = Doc(fx, 14)
+    d2.set_text("aaaaaaaaaaaa\u20ac".encode())  # 12 + 3 bytes
+    assert d2.text == b"a" * 12, d2.text
+
+
+@test
+def test_edit_insert_middle_and_ends(fx):
+    d = Doc(fx, 128).set_text(b"abc")
+    d.move(1)
+    assert d.insert(b"XY") == 2
+    assert d.text == b"aXYbc"
+    assert d.cursor == 3
+    assert d.dirty == 1
+    d.move(0)
+    d.insert(b"<")
+    assert d.text == b"<aXYbc"
+    d.move(d.length)
+    d.insert(b">")
+    assert d.text == b"<aXYbc>"
+
+
+@test
+def test_edit_insert_replaces_selection(fx):
+    d = Doc(fx, 128).set_text(b"hello world")
+    d.select(0, 5)                 # "hello"
+    d.move(5)
+    d.select(0, 5)
+    assert d.insert(b"goodbye") == 7
+    assert d.text == b"goodbye world"
+    assert d.cursor == 7
+    # a backwards selection behaves identically
+    d.select(8, 13)
+    d.insert(b"there")
+    assert d.text == b"goodbye there"
+
+
+@test
+def test_edit_selection_helpers(fx):
+    d = Doc(fx, 64).set_text(b"abcdef")
+    d.select(4, 1)
+    assert fx.call("nota_doc_sel_start", d.doc) == 1
+    assert fx.call("nota_doc_sel_end", d.doc) == 4
+    assert fx.call("nota_doc_has_selection", d.doc) == 1
+    d.select(3, 3)
+    assert fx.call("nota_doc_has_selection", d.doc) == 0
+    d.select(4, 1)
+    assert fx.call("nota_doc_delete_selection", d.doc) == 3
+    assert d.text == b"aef"
+
+
+@test
+def test_edit_backspace_forward_delete(fx):
+    d = Doc(fx, 64).set_text(b"abc")
+    d.move(3)
+    assert d.backspace() == 1
+    assert d.text == b"ab" and d.cursor == 2
+    d.move(0)
+    assert d.delete_forward() == 1
+    assert d.text == b"b" and d.cursor == 0
+    assert d.delete_forward() == 1
+    assert d.text == b""
+    assert d.delete_forward() == 0        # nothing left
+    assert d.backspace() == 0
+
+
+@test
+def test_edit_multibyte_editing(fx):
+    """Every operation must move by whole code points."""
+    euro = "\u20ac".encode()
+    d = Doc(fx, 128).set_text(euro + b"x" + euro)
+    assert d.cps == 3
+    d.move(3)                       # after the first euro
+    assert d.cursor == 3
+    d.move(1)                       # asked for byte 1, inside the euro
+    assert d.cursor == 0, "cursor must snap back to a code point boundary"
+    d.move(4)                       # "x" starts here: a legal position
+    assert d.cursor == 4
+    d.move(5)                       # inside the second euro
+    assert d.cursor == 4
+    # backspace removes the whole euro, not one byte
+    d.move(3)
+    assert d.backspace() == 3
+    assert d.text == b"x" + euro
+    # forward delete removes the whole euro too
+    d.move(1)
+    assert d.delete_forward() == 3
+    assert d.text == b"x"
+
+
+@test
+def test_edit_insert_codepoint(fx):
+    d = Doc(fx, 128).set_text(b"ab")
+    d.move(1)
+    assert d.insert_cp(0x20AC) == 3
+    assert d.text == b"a" + "\u20ac".encode() + b"b"
+    assert d.cursor == 4
+    assert d.cps == 3
+    assert d.insert_cp(0x1F600) == 4
+    assert d.cps == 4
+    # invalid code points are rejected without touching the document
+    before = d.text
+    assert d.insert_cp(0xD800) == -3
+    assert d.text == before
+
+
+@test
+def test_edit_undo_insert(fx):
+    d = Doc(fx, 128).set_text(b"abc")
+    d.move(1)
+    d.insert(b"X")
+    assert d.text == b"aXbc"
+    assert d.undo() == 1
+    assert d.text == b"abc"
+    assert d.redo() == 1
+    assert d.text == b"aXbc"
+    assert d.redo() == 0
+    assert d.undo() == 1
+    assert d.undo() == 0        # history exhausted
+
+
+@test
+def test_edit_undo_delete(fx):
+    d = Doc(fx, 128).set_text(b"abcdef")
+    d.replace(2, 4)             # remove "cd"
+    assert d.text == b"abef"
+    assert d.undo() == 1
+    assert d.text == b"abcdef"
+    assert d.redo() == 1
+    assert d.text == b"abef"
+
+
+@test
+def test_edit_undo_selection_replace_is_one_step(fx):
+    d = Doc(fx, 128).set_text(b"hello world")
+    d.select(0, 5)
+    d.insert(b"bye")
+    assert d.text == b"bye world"
+    assert d.undo() == 1
+    assert d.text == b"hello world", "a replace must undo in one step"
+    assert d.undo() == 0
+
+
+@test
+def test_edit_typing_burst_coalesces(fx):
+    d = Doc(fx, 128)
+    for ch in b"hello":
+        d.insert(bytes([ch]))
+    assert d.text == b"hello"
+    assert fx.call("nota_doc_undo", d.doc) == 1
+    assert d.text == b"", f"a typing burst should undo as one step, got {d.text!r}"
+
+
+@test
+def test_edit_burst_breaks_on_move(fx):
+    d = Doc(fx, 128)
+    d.insert(b"ab")
+    d.move(0)                  # a cursor jump ends the burst
+    d.move(2)
+    d.insert(b"cd")
+    assert d.text == b"abcd"
+    assert d.undo() == 1
+    assert d.text == b"ab", f"got {d.text!r}"
+    assert d.undo() == 1
+    assert d.text == b""
+
+
+@test
+def test_edit_undo_after_new_edit_drops_redo(fx):
+    d = Doc(fx, 128).set_text(b"a")
+    d.move(1)
+    d.insert(b"b")
+    d.undo()
+    assert d.text == b"a"
+    d.insert(b"c")             # discards the redo tail
+    assert d.redo() == 0
+    assert d.text == b"ac"
+
+
+@test
+def test_edit_cursor_movement(fx):
+    d = Doc(fx, 128).set_text(b"line one\nline two\nxyz")
+    assert d.length == 21
+    d.move(0)
+    fx.call("nota_doc_move_right", d.doc, 0)
+    assert d.cursor == 1
+    fx.call("nota_doc_move_left", d.doc, 0)
+    assert d.cursor == 0
+    fx.call("nota_doc_move_left", d.doc, 0)
+    assert d.cursor == 0, "cannot move before the start"
+    d.move(4)
+    fx.call("nota_doc_move_line_end", d.doc, 0)
+    assert d.cursor == 8, d.cursor
+    fx.call("nota_doc_move_line_start", d.doc, 0)
+    assert d.cursor == 0
+    d.move(d.length)
+    fx.call("nota_doc_move_line_end", d.doc, 0)
+    assert d.cursor == d.length
+
+
+@test
+def test_edit_extend_selection(fx):
+    d = Doc(fx, 128).set_text(b"abcdef")
+    d.move(2)
+    fx.call("nota_doc_move_right", d.doc, 1)
+    fx.call("nota_doc_move_right", d.doc, 1)
+    assert d.cursor == 4 and d.anchor == 2, (d.cursor, d.anchor)
+    assert fx.call("nota_doc_has_selection", d.doc) == 1
+    # shrinking back: prev(4) is 3, still past the anchor
+    fx.call("nota_doc_move_left", d.doc, 1)
+    assert d.cursor == 3 and d.anchor == 2
+    fx.call("nota_doc_move_left", d.doc, 1)
+    assert d.cursor == 2, "cannot extend before the anchor"
+
+
+@test
+def test_edit_vertical_movement_keeps_column(fx):
+    d = Doc(fx, 128).set_text(b"long line here\nshort\nanother long line")
+    d.move(7)                    # column 7 on line 0
+    fx.call("nota_doc_move_vert", d.doc, 1, 0)
+    assert d.text.decode().split("\n")[1] == "short"
+    assert d.cursor == 15 + 5, d.cursor     # clamped to the end of "short"
+    fx.call("nota_doc_move_vert", d.doc, 1, 0)
+    line3_start = d.text.index(b"another")
+    assert d.cursor == line3_start + 7, d.cursor
+    fx.call("nota_doc_move_vert", d.doc, -1, 0)
+    assert d.cursor == 15 + 5
+
+
+@test
+def test_edit_select_word(fx):
+    d = Doc(fx, 128).set_text(b"foo bar baz")
+    fx.call("nota_doc_select_word_at", d.doc, 5)     # inside "bar"
+    assert (d.anchor, d.cursor) == (4, 7), (d.anchor, d.cursor)
+    # non-ASCII text selects as a single word
+    d.set_text("\u00e9\u00e9\u00e9 x".encode())
+    fx.call("nota_doc_select_word_at", d.doc, 1)   # inside the accented word
+    assert (d.anchor, d.cursor) == (0, 6), (d.anchor, d.cursor)
+    fx.call("nota_doc_select_word_at", d.doc, 7)   # the trailing "x"
+    assert (d.anchor, d.cursor) == (7, 8), (d.anchor, d.cursor)
+
+
+@test
+def test_edit_select_all_and_delete(fx):
+    d = Doc(fx, 128).set_text(b"everything here")
+    fx.call("nota_doc_select_all", d.doc)
+    assert d.anchor == 0 and d.cursor == d.length
+    assert d.backspace() == len(b"everything here")
+    assert d.text == b""
+    assert d.undo() == 1
+    assert d.text == b"everything here"
+
+
+@test
+def test_edit_line_helpers(fx):
+    text = b"aa\nbbb\n\ncccc"
+    d = Doc(fx, 128).set_text(text)
+    assert fx.call("nota_line_count", d.buf, len(text)) == 4
+    for off, line in [(0, 0), (1, 0), (2, 0), (3, 1), (7, 2), (11, 3)]:
+        assert fx.call("nota_line_of", d.buf, len(text), off) == line, off
+    assert fx.call("nota_line_start", d.buf, 4) == 3
+    assert fx.call("nota_line_end", d.buf, len(text), 4) == 6
 
 
 # --------------------------------------------------------------- runner -----
