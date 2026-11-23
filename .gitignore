@@ -1,0 +1,22 @@
+# Build outputs
+build/
+out/
+dist/
+*.o
+*.a
+*.so
+*.apk
+*.apk.idsig
+*.dex
+*.class
+# Local toolchains / venvs
+.venv/
+.toolchain/
+# Python caches
+__pycache__/
+*.pyc
+# Local signing material (never commit real keys)
+*.jks
+*.keystore
+*.p12
+local.properties
