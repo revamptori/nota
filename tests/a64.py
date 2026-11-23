@@ -433,7 +433,9 @@ class Machine:
         rt = insn & 0x1F
         imm = sx((insn >> 12) & 0x1FF, 9)
         base = self.get(rn, is_sp=True)
-        addr = base + imm if mode in (2, 3) else base
+        # mode: 00 unscaled (LDUR/STUR), 01 post-index, 10 unprivileged, 11 pre.
+        # Only post-index reads the base itself; everything else adds imm.
+        addr = base if mode == 1 else base + imm
         width = 1 << size                # bytes accessed (not destination size)
         # opc: 00 = store, 01 = load, 10 = signed load (or STTR when the
         # mode field says unprivileged), 11 = LDRSW. Only opc == 0 stores.

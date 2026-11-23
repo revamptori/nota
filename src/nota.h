@@ -217,6 +217,46 @@
 #define EDIT_ERR_RANGE -2
 #define EDIT_ERR_CP    -3
 
+/* ---------------------------------------------------------- notes/records ---
+ * struct note: the editor/store working representation. Title and body point
+ * into a per-note arena so the struct stays fixed-size.
+ */
+#define NOTE_ID        0x00
+#define NOTE_FLAGS     0x04
+#define NOTE_FOLDER    0x08
+#define NOTE_TAGS      0x0C   /* u32 count                         */
+#define NOTE_CREATED   0x10
+#define NOTE_UPDATED   0x18
+#define NOTE_TITLE_LEN 0x20   /* u32                               */
+#define NOTE_BODY_LEN  0x24   /* u32                               */
+#define NOTE_TITLE_PTR 0x28
+#define NOTE_BODY_PTR  0x30
+#define NOTE_TAG_PTR   0x38   /* u32 array                         */
+#define NOTE_SIZE      0x40
+
+#define NOTE_HDR_SIZE  0x28   /* bytes of fixed fields in a record   */
+#define NOTE_FLAG_PINNED  0x01
+#define NOTE_FLAG_TRASHED 0x02
+
+/* folder record in memory */
+#define FOLDER_ID      0x00
+#define FOLDER_PARENT  0x04
+#define FOLDER_NAME_PTR 0x08
+#define FOLDER_SIZE    0x10
+
+/* tag record in memory */
+#define TAG_ID         0x00
+#define TAG_NAME_PTR   0x08
+#define TAG_SIZE       0x10
+
+/* store results */
+#define STORE_OK            0
+#define STORE_ERR_TRUNCATED -1
+#define STORE_ERR_CORRUPT   -2
+#define STORE_ERR_NOSPACE   -3
+#define STORE_ERR_IO        -4
+#define STORE_ERR_FULL      -5
+
 /* ---------------------------------------------------------------- Sizes ---- */
 #define MAX_NOTES        512
 #define MAX_FOLDERS      64

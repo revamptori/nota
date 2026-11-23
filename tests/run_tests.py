@@ -22,7 +22,7 @@ from elftools.elf.elffile import ELFFile                # noqa: E402
 CC = os.environ.get("NOTA_CC", "zig cc -target aarch64-linux-android").split()
 BUILD = os.path.join(ROOT, "build", "tests")
 
-SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S", "src/edit.S"]          # flat-testable modules (no bionic calls)
+SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S", "src/edit.S", "src/store.S"]          # flat-testable modules (no bionic calls)
 TESTS = []
 
 
@@ -794,6 +794,185 @@ def test_edit_line_helpers(fx):
         assert fx.call("nota_line_of", d.buf, len(text), off) == line, off
     assert fx.call("nota_line_start", d.buf, 4) == 3
     assert fx.call("nota_line_end", d.buf, len(text), 4) == 6
+
+
+# ----------------------------------------------------------------- store ----
+NOTE_ID, NOTE_FLAGS, NOTE_FOLDER, NOTE_TAGS = 0x00, 0x04, 0x08, 0x0C
+NOTE_CREATED, NOTE_UPDATED = 0x10, 0x18
+NOTE_TITLE_LEN, NOTE_BODY_LEN = 0x20, 0x24
+NOTE_TITLE_PTR, NOTE_BODY_PTR, NOTE_TAG_PTR = 0x28, 0x30, 0x38
+NOTE_SIZE = 0x40
+
+
+class Note:
+    """A note struct plus its string arena, allocated in the interpreter."""
+
+    def __init__(self, fx, title=b"", body=b"", nid=1, folder=0, tags=(),
+                 flags=0, created=0, updated=0):
+        self.fx = fx
+        self.addr = fx.alloc(NOTE_SIZE)
+        arena = fx.alloc(4096)
+        t = fx.alloc(len(title) + 1)
+        fx.m.store_mem(t, title + b"\0")
+        b = fx.alloc(len(body) + 1)
+        fx.m.store_mem(b, body + b"\0")
+        self.tagarr = fx.alloc(64)
+        if tags:
+            fx.m.store_mem(self.tagarr,
+                           b"".join(int(x).to_bytes(4, "little") for x in tags))
+        self._set(NOTE_ID, nid, 4)
+        self._set(NOTE_FLAGS, flags, 4)
+        self._set(NOTE_FOLDER, folder, 4)
+        self._set(NOTE_TAGS, len(tags), 4)
+        self._set(NOTE_CREATED, created)
+        self._set(NOTE_UPDATED, updated)
+        self._set(NOTE_TITLE_LEN, len(title), 4)
+        self._set(NOTE_BODY_LEN, len(body), 4)
+        self._set(NOTE_TITLE_PTR, t)
+        self._set(NOTE_BODY_PTR, b)
+        self._set(NOTE_TAG_PTR, self.tagarr)
+
+    def _set(self, off, v, width=8):
+        self.fx.m.store_mem(self.addr + off,
+                            (v & ((1 << (width * 8)) - 1)).to_bytes(width, "little"))
+
+    def _get(self, off, width=8):
+        return int.from_bytes(self.fx.read(self.addr + off, width), "little")
+
+    def field(self, off, width=8):
+        return self._get(off, width)
+
+    title = property(lambda self: self.fx.read_cstr(self._get(NOTE_TITLE_PTR)))
+    body = property(lambda self: self.fx.read_cstr(self._get(NOTE_BODY_PTR)))
+
+
+@test
+def test_store_path_join(fx):
+    dst = fx.alloc(64)
+    n = fx.call("nota_path_join", dst, 64, fx.cstr("/data/nota"),
+                fx.cstr("notes.db"))
+    assert n == len("/data/nota/notes.db"), n
+    assert fx.read_cstr(dst) == b"/data/nota/notes.db"
+    # a trailing slash is not doubled
+    fx.call("nota_path_join", dst, 64, fx.cstr("/data/nota/"),
+            fx.cstr("x.db"))
+    assert fx.read_cstr(dst) == b"/data/nota/x.db"
+    # truncation is reported, never silent
+    assert s32(fx.call("nota_path_join", dst, 8, fx.cstr("/data/nota"),
+                       fx.cstr("notes.db"))) == -1
+
+
+@test
+def test_store_path_suffixes(fx):
+    # these append to a path that is already in the buffer (the store writes
+    # the path into a stack buffer, then derives the temp and backup names)
+    dst = fx.alloc(64)
+    src = fx.cstr("/data/a.db")
+    fx.call("nota_strcpy", dst, src)
+    fx.call("nota_path_mktmp", dst, dst)
+    assert fx.read_cstr(dst) == b"/data/a.db.tmp", fx.read_cstr(dst)
+    fx.call("nota_strcpy", dst, src)
+    fx.call("nota_path_mkbak", dst, dst)
+    assert fx.read_cstr(dst) == b"/data/a.db.bak", fx.read_cstr(dst)
+
+
+@test
+def test_store_int_codecs(fx):
+    buf = fx.alloc(16)
+    fx.call("nota_put_u32", buf, 0xDEADBEEF)
+    assert fx.read(buf, 4) == b"\xef\xbe\xad\xde"     # little endian
+    assert fx.call("nota_get_u32", buf) == 0xDEADBEEF
+    fx.call("nota_put_u64", buf, 0x1122334455667788)
+    assert fx.call("nota_get_u64", buf) == 0x1122334455667788
+
+
+@test
+def test_store_note_roundtrip(fx):
+    n = Note(fx, title=b"My note", body="body \u20ac text".encode(),
+             nid=7, folder=3, tags=(1, 4), flags=1, created=1000, updated=2000)
+    buf = fx.alloc(4096)
+    size = fx.call("nota_note_encode", n.addr, buf)
+    assert size == fx.call("nota_note_encoded_size", n.addr)
+    # decode into a fresh note
+    out = fx.alloc(NOTE_SIZE)
+    arena = fx.alloc(4096)
+    tags = fx.alloc(64)
+    fx.m.store_mem(out + NOTE_TAG_PTR, tags.to_bytes(8, "little"))
+    used = s32(fx.call("nota_note_decode", buf, size, out, arena, 4096))
+    assert used == size, used
+    got = Note.__new__(Note)
+    got.fx, got.addr = fx, out
+    assert got.field(NOTE_ID, 4) == 7
+    assert got.field(NOTE_FOLDER, 4) == 3
+    assert got.field(NOTE_FLAGS, 4) == 1
+    assert got.field(NOTE_TAGS, 4) == 2
+    assert got.field(NOTE_CREATED) == 1000
+    assert got.field(NOTE_UPDATED) == 2000
+    assert got.title == b"My note"
+    assert got.body == "body \u20ac text".encode()
+    assert fx.read(tags, 8) == (1).to_bytes(4, "little") + (4).to_bytes(4, "little")
+
+
+@test
+def test_store_note_detects_corruption(fx):
+    n = Note(fx, title=b"t", body=b"abcdef")
+    buf = fx.alloc(512)
+    size = fx.call("nota_note_encode", n.addr, buf)
+    out = fx.alloc(NOTE_SIZE)
+    fx.m.store_mem(out + NOTE_TAG_PTR, fx.alloc(64).to_bytes(8, "little"))
+    arena = fx.alloc(256)
+    # flip a body byte: the crc must catch it
+    raw = bytearray(fx.read(buf, size))
+    raw[-1] ^= 0xFF
+    fx.m.store_mem(buf, bytes(raw))
+    assert s32(fx.call("nota_note_decode", buf, size, out, arena, 256)) == -2
+    # a truncated record is reported separately from corruption: the reader
+    # has fewer bytes on hand than the record's own length prefix claims
+    fx.m.store_mem(buf, bytes(raw[:-3]))
+    assert s32(fx.call("nota_note_decode", buf, size - 3, out, arena, 256)) == -1
+    # an arena that is too small is refused rather than overrun
+    raw2 = bytearray(fx.read(buf, size))
+    fx.m.store_mem(buf, bytes(fx.read(buf, size)))
+    n2 = Note(fx, title=b"t", body=b"abcdef")
+    size2 = fx.call("nota_note_encode", n2.addr, buf)
+    assert s32(fx.call("nota_note_decode", buf, size2, out, arena, 4)) == -3
+
+
+@test
+def test_store_save_and_reload(fx):
+    import sysemu
+    k = sysemu.Kernel()
+    fx.m.syscall = k
+    path = fx.cstr("/data/nota/notes.db")
+    data = fx.cstr(b"payload" * 100)
+    n = s32(fx.call("nota_store_save_file", path, data, 700))
+    assert n == 700, n
+    assert k.files["/data/nota/notes.db"] == b"payload" * 100
+    assert "/data/nota/notes.db.tmp" not in k.files
+    # a second save takes a backup of the first
+    data2 = fx.cstr(b"second version")
+    assert s32(fx.call("nota_store_save_file", path, data2, 14)) == 14
+    assert k.files["/data/nota/notes.db"] == b"second version"
+    assert k.files["/data/nota/notes.db.bak"] == b"payload" * 100
+
+
+@test
+def test_store_failed_save_keeps_previous(fx):
+    """A crash mid-write must not damage the last good file."""
+    import sysemu
+    k = sysemu.Kernel()
+    k.files["/data/nota/notes.db"] = bytearray(b"GOOD")
+    fx.m.syscall = k
+    path = fx.cstr("/data/nota/notes.db")
+    data = fx.cstr(b"NEW DATA")
+    k.write_allowed = 0
+    n = s32(fx.call("nota_store_save_file", path, data, 8))
+    assert n < 0, n
+    assert k.files["/data/nota/notes.db"] == b"GOOD", "old data must survive"
+    # nothing was replaced, so there is nothing to back up; what matters is
+    # that the half-written staging file was cleaned up rather than left to
+    # be mistaken for a complete one
+    assert "/data/nota/notes.db.tmp" not in k.files, k.files.keys()
 
 
 # --------------------------------------------------------------- runner -----
