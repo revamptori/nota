@@ -57,6 +57,7 @@ class Machine:
         self.insn_count = 0
         self.cycles = 0        # rough cost model: 1 per insn, +4 memory
         self.exit_pc = None
+        self.syscall = None    # optional handler(machine) -> next pc
         self._cache = {}
 
     # ---------------------------------------------------------- memory ----
@@ -153,6 +154,14 @@ class Machine:
     # ------------------------------------------------------------ core ----
     def step(self):
         insn = self.fetch()
+        # `svc #0` is the boundary between NOTA and the kernel. A Machine has a
+        # syscall handler so tests can service file I/O from the host; without
+        # one the trap is loud rather than silently wrong.
+        if (insn & 0xFFE0001F) == 0xD4000001:
+            if self.syscall is None:
+                raise IllegalInstruction(
+                    f"svc #0 at {self.pc:#x} but no syscall handler installed")
+            return self.syscall(self)
         # (single-step; `run()` drives the PC)
         pc = self.pc
         handler = self._cache.get(insn)
@@ -218,13 +227,25 @@ class Machine:
             return pc + off if taken else pc + 4
 
         # ---- loads and stores ----
-        if (insn & 0x3B000000) == 0x39000000:            # LDR/STR (imm)
+        # LDR/STR immediate forms. All share bits 29:27 == 111 with V (bit 26)
+        # clear; the discriminator is bits 11:10, NOT bit 24 (bit 24 is only
+        # set for the unsigned-offset form *when the offset is non-zero* -
+        # [x1] and [x1,#0] encode as 0x39.. with bit 24 set but are otherwise
+        # identical). Verified against the assembler:
+        #   11:10 == 00 -> unsigned offset, 12-bit immediate scaled by access
+        #   11:10 != 00 -> 9-bit signed immediate, mode 01 post / 11 pre /
+        #                  10 unprivileged / 00 unscaled
+        # Bit 24 selects the form: 1 = unsigned 12-bit scaled offset,
+        # 0 = 9-bit signed immediate (unscaled / post / pre / unprivileged).
+        # The size field (31:30) is independent of bit 24, so `strb [x1]`
+        # (0x39000022) and `ldrb [x1],#1` (0x38401423) differ only there.
+        if (insn & 0x3F000000) == 0x39000000:
             return self.ldst_imm(insn, pc)
-        if (insn & 0x3B200000) == 0x38000000:            # LDR/STR (imm9)
-            # bits 11:10 encode mode; accept all four.
+        if (insn & 0x3F000000) == 0x38000000:
+            # bit 21 distinguishes register-offset (0x382008xx) from imm9
+            if (insn & 0x3B200C00) == 0x38200800:
+                return self.ldst_reg(insn, pc)
             return self.ldst_prepost(insn, pc)
-        if (insn & 0x3B200C00) == 0x38200800:            # LDR/STR (reg)
-            return self.ldst_reg(insn, pc)
         # LDP/STP: bit 26 (V) must be 0 for general registers, and bits
         # 24:23 distinguish no-allocate / post-index / offset / pre-index.
         if (insn & 0x3A000000) == 0x28000000:
@@ -385,23 +406,20 @@ class Machine:
         imm = ((insn >> 10) & 0xFFF) << size
         base = self.get(rn, is_sp=True)
         addr = base + imm
-        if opc == 1:  # load
-            if size == 0:
-                v = int.from_bytes(self.load_mem(addr, 1), "little")
-            elif size == 1:
-                v = int.from_bytes(self.load_mem(addr, 2), "little")
-            elif size == 2:
-                v = int.from_bytes(self.load_mem(addr, 4), "little")
-                if (insn >> 23) & 1:  # ldrsw
-                    v = sx(v, 32)
-            else:
-                v = int.from_bytes(self.load_mem(addr, 8), "little")
-            self.bytes = self.load_mem(addr, 1 << size)
+        width = 1 << size                # bytes accessed
+        # opc: 00 store, 01 load, 10 signed load (LDRSB/LDRSH/LDRSW),
+        # 11 privileged. Only opc == 0 stores.
+        if opc != 0:
+            v = int.from_bytes(self.load_mem(addr, width), "little")
+            if opc == 2 and size != 3:            # signed loads
+                v = sx(v, width * 8)
+            self.bytes = self.load_mem(addr, width)
             self.set(rt, v)
             self.cycles += 4
-        else:        # store
+        else:                            # store
             v = self.get(rt)
-            self.store_mem(addr, (v & ((1 << (8 << size)) - 1)).to_bytes(1 << size, "little"))
+            self.store_mem(addr, (v & ((1 << (width * 8)) - 1))
+                           .to_bytes(width, "little"))
             self.cycles += 4
         return pc + 4
 
@@ -417,9 +435,11 @@ class Machine:
         base = self.get(rn, is_sp=True)
         addr = base + imm if mode in (2, 3) else base
         width = 1 << size                # bytes accessed (not destination size)
-        if opc & 1:                      # load
+        # opc: 00 = store, 01 = load, 10 = signed load (or STTR when the
+        # mode field says unprivileged), 11 = LDRSW. Only opc == 0 stores.
+        if opc != 0 and not (mode == 2 and opc == 2):
             raw = int.from_bytes(self.load_mem(addr, width), "little")
-            if (opc & 2) and size != 3:  # ldrsb/ldrsh/ldrsw
+            if opc in (2, 3) and size != 3:   # LDRSB / LDRSH
                 raw = sx(raw, width * 8)
             self.set(rt, raw)
             self.cycles += 4
@@ -459,33 +479,25 @@ class Machine:
         rn = (insn >> 5) & 0x1F
         rt = insn & 0x1F
         imm = sx((insn >> 15) & 0x7F, 7)
-        if mode & 1:                 # offset is scaled by the access size
-            imm <<= 2 if opc == 0 else 3
-            if opc == 1:             # LDPSW: signed words, 8-byte step
-                imm <<= 1
+        # imm7 is *always* scaled by the access size, in every mode: the
+        # assembler encodes [sp,#16] as imm7=2 for a 64-bit pair, and
+        # [sp,#-32]! as imm7=124 (= -4 * 8).
+        imm <<= 2 if opc == 0 else 3
+        if opc == 1:                 # LDPSW: signed words, 8-byte step
+            imm <<= 1
         base = self.get(rn, is_sp=True)
-        # mode: 00 no writeback, 01 post-index, 10 signed offset, 11 pre-index
+        # mode bits (24:23), verified against the assembler:
+        #   01 = post-index, 10 = signed offset, 11 = pre-index. NOTA never
+        # emits 00 (non-temporal pair), so it is rejected rather than guessed.
+        if mode == 0:
+            raise IllegalInstruction("non-temporal ldp/stp unsupported")
+        # post-index accesses the base address and writes back afterwards;
+        # offset and pre-index both access base + imm (only pre-index writes
+        # back, which _ldp_stp_body handles).
         addr = base if mode == 1 else base + imm
         # `imm` must stay the scaled offset for the write-back below
         return self._ldp_stp_body(insn, pc, opc, mode, rt, rt2, rn, base,
                                   addr, imm)
-
-    def ldp_stp(self, insn, pc):
-        opc = (insn >> 30) & 3
-        rt2 = (insn >> 10) & 0x1F
-        rn = (insn >> 5) & 0x1F
-        rt = insn & 0x1F
-        imm = ((insn >> 15) & 0x7F)
-        # scaled by element size: 32-bit -> 4, 64-bit -> 8, LDPSW -> 4
-        if opc == 0:
-            imm <<= 2
-        elif opc == 1:
-            imm <<= 2
-        else:
-            imm <<= 3
-        base = self.get(rn, is_sp=True)
-        return self._ldp_stp_body(insn, pc, opc, 2, rt, rt2, rn, base,
-                                  base + imm, imm)
 
     def _ldp_stp_body(self, insn, pc, opc, mode, rt, rt2, rn, base, addr, imm=0):
         width = 4 if opc == 0 else 8
@@ -591,12 +603,22 @@ class Machine:
         sf = (insn >> 31) & 1
         opc = (insn >> 29) & 3
         shift_type = (insn >> 22) & 3
+        # N (bit 21) inverts the shifted operand: that is what turns
+        # ORR/BIC/EOR/ANDS into ORN/BIC-inverted/EON/BICS and `mvn`.
+        invert = (insn >> 21) & 1
         rm = (insn >> 16) & 0x1F
         imm6 = (insn >> 10) & 0x3F
         rn = (insn >> 5) & 0x1F
         rd = insn & 0x1F
         a = self.get(rn)
         b = self.shift(self.get(rm), shift_type, imm6, sf)
+        if invert:
+            b = ~b & (MASK64 if sf else 0xFFFFFFFF)
+        if opc == 3:                    # ANDS: sets flags, Rd may be XZR
+            res = a & b
+            self.set_flags(res, False, False, sf)
+            self.set(rd, res)
+            return pc + 4
         res = self._logic(opc, a, b, sf)
         self.set(rd, res)
         return pc + 4
@@ -680,6 +702,15 @@ class Machine:
         return pc + 4
 
     def bitfield(self, insn, pc):
+        """SBFM (opc 0), BFM (opc 1), UBFM (opc 2).
+
+        The bespoke per-alias version this replaces got ubfx/sxtb/lsr wrong.
+        The definitions below are the canonical ones - note that the two
+        cases (imms >= immr vs imms < immr) are what make `lsr` and `lsl`
+        out of the same instruction:
+          imms >= immr:  field starts at immr, width imms-immr+1
+          imms <  immr:  field is placed at width-immr, width imms+1
+        """
         sf = (insn >> 31) & 1
         opc = (insn >> 29) & 3
         n = (insn >> 22) & 1
@@ -688,44 +719,37 @@ class Machine:
         rn = (insn >> 5) & 0x1F
         rd = insn & 0x1F
         width = 64 if sf else 32
-        src = self.get(rn) & (MASK64 if sf else 0xFFFFFFFF)
-        wmask = (1 << width) - 1
-        if opc == 0:      # sbfm -> sbfx/sxtb/sxth/sxtw
-            # sign extend bits [immr+imms : immr] ... clang emits sbfm for those
+        mask = (1 << width) - 1
+        src = self.get(rn) & mask
+        if n != sf:
+            raise IllegalInstruction(f"bitfield N={n} sf={sf} mismatch")
+        if opc == 2 or opc == 0:                 # UBFM / SBFM
             if imms >= immr:
-                size = imms - immr + 1
-                v = sx((src >> immr) & ((1 << size) - 1), size)
+                w = imms - immr + 1
+                v = (src >> immr) & ((1 << w) - 1)
             else:
-                # rotate then mask (used for sxtb etc with immr>imms)
-                lo = width - immr
-                rot = ((src >> immr) | (src << lo)) & wmask
-                size = imms + 1
-                v = sx(rot & ((1 << size) - 1), size)
-            res = v & wmask
-        elif opc == 1:    # bfm -> bfi/bfxil
-            if imms >= immr:
-                size = imms - immr + 1
-                field = (src >> immr) & ((1 << size) - 1)
-                dstmask = ((1 << size) - 1) << immr
-                res = (self.get(rd) & ~dstmask & wmask) | (field << immr)
+                shift = width - immr
+                w = imms + 1
+                v = (src << shift) & ((1 << w) - 1)
+            if opc == 0:                          # sign extend from bit w-1
+                if (v >> (w - 1)) & 1:
+                    res = (mask ^ ((1 << w) - 1)) | v
+                else:
+                    res = v
             else:
-                lsb = imms + 1
-                size = immr - imms
-                field = (src >> lsb) & ((1 << size) - 1)
-                dstmask = (1 << size) - 1
-                res = (self.get(rd) & ~dstmask & wmask) | field
-        else:             # ubfm -> ubfx/lsl/lsr/ubfiz
-            size = imms + 1
-            v = src
-            if immr:
-                rot = ((v >> immr) | (v << (width - immr))) & wmask
-            else:
-                rot = v
-            res = rot & ((1 << size) - 1) if size < width else rot
-            # ubfm with imms == width-1 and immr -> lsr
-            if imms == width - 1:
-                res = (src >> immr) & wmask
-        self.set(rd, res)
+                res = v
+        elif opc == 1:                            # BFM
+            dst = self.get(rd) & mask
+            if imms >= immr:                      # BFXIL
+                keep = (1 << (imms + 1)) - 1
+                res = (dst & ~keep & mask) | (src & keep)
+            else:                                 # BFI / BFXIL
+                shift = width - immr
+                bits = (1 << (imms + 1)) - 1
+                res = (dst & ~(bits << shift) & mask) | ((src & bits) << shift)
+        else:
+            raise IllegalInstruction(f"bitfield opc {opc}")
+        self.set(rd, res & mask)
         return pc + 4
 
     def extract(self, insn, pc):
@@ -753,25 +777,22 @@ class Machine:
         rd = insn & 0x1F
         a = self.get(rn)
         b = self.get(rm)
-        if opcode in (0x02, 0x00):     # udiv / sdiv
+        # DP 2-source opcodes: 2 = UDIV, 3 = SDIV (unsigned and signed are
+        # distinct encodings, not one encoding with a flag).
+        if opcode in (0x02, 0x03):
             if b == 0:
-                self.set(rd, 0)
+                self.set(rd, 0)          # ARM defines division by zero as 0
                 return pc + 4
-            if sf:
-                av = a - (1 << 64) if a >> 63 else a
-                bv = b - (1 << 64) if b >> 63 else b
-            else:
-                av = sx(a, 32)
-                bv = sx(b, 32)
-            if opcode == 0x02:
-                if av < 0:
-                    av = -av
-                if bv < 0:
-                    bv = -bv
-            q = abs(int(av)) // abs(int(bv))
-            if (av < 0) != (bv < 0):
-                q = -q
-            self.set(rd, q)
+            mask = MASK64 if sf else 0xFFFFFFFF
+            if opcode == 0x02:           # UDIV
+                q = (a & mask) // (b & mask)
+            else:                        # SDIV, truncating toward zero
+                av = sx(a, 64 if sf else 32)
+                bv = sx(b, 64 if sf else 32)
+                q = abs(av) // abs(bv)
+                if (av < 0) != (bv < 0):
+                    q = -q
+            self.set(rd, q & mask)
             return pc + 4
         if opcode == 0x08:     # lslv
             amt = b & (63 if sf else 31)

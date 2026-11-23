@@ -22,7 +22,7 @@ from elftools.elf.elffile import ELFFile                # noqa: E402
 CC = os.environ.get("NOTA_CC", "zig cc -target aarch64-linux-android").split()
 BUILD = os.path.join(ROOT, "build", "tests")
 
-SOURCES = ["src/libc.S"]          # flat-testable modules (no bionic calls)
+SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S"]          # flat-testable modules (no bionic calls)
 TESTS = []
 
 
@@ -39,7 +39,7 @@ def s32(v):
 
 # ---------------------------------------------------------------- fixture ----
 class Fixture:
-    def __init__(self, elf, syms):
+    def __init__(self, elf, syms, kernel=None):
         self.elf = elf
         self.syms = syms
         self.m = Machine()
@@ -50,6 +50,8 @@ class Fixture:
         self.m.sp = 0x1E0000
         self.heap = 0x1000000
         self.data = 0x1800000
+        if kernel is not None:
+            self.m.syscall = kernel
         with open(elf, "rb") as fh:
             e = ELFFile(fh)
             for seg in e.iter_segments():
@@ -232,6 +234,201 @@ def test_atoi(fx):
                     ("-9", -9), ("  33", 33), ("12ab", 12)]:
         got = s32(fx.call("nota_atoi", fx.cstr(s)))
         assert got == want, f"atoi({s!r}) = {got}, want {want}"
+
+
+@test
+def test_utf8_decode(fx):
+    cases = [
+        ("A", 0x41, 1),
+        ("\u00e9", 0xE9, 2),          # é
+        ("\u20ac", 0x20AC, 3),        # €
+        ("\U0001F600", 0x1F600, 4),   # 😀
+    ]
+    for s, cp, n in cases:
+        addr = fx.cstr(s)
+        out = fx.alloc(8)
+        got = fx.call("nota_utf8_decode", addr, out)
+        val = int.from_bytes(fx.read(out, 4), "little")
+        assert got == n, f"decode({s!r}) consumed {got}, want {n}"
+        assert val == cp, f"decode({s!r}) = {val:#x}, want {cp:#x}"
+
+
+@test
+def test_utf8_encode(fx):
+    dst = fx.alloc(16)
+    for cp, want in [(0x41, b"A"), (0xE9, "\u00e9".encode()),
+                     (0x20AC, "\u20ac".encode()),
+                     (0x1F600, "\U0001F600".encode())]:
+        n = fx.call("nota_utf8_encode", dst, cp)
+        assert n == len(want), f"encode({cp:#x}) = {n} bytes, want {len(want)}"
+        assert fx.read(dst, n) == want
+    # surrogates and out-of-range are rejected
+    assert fx.call("nota_utf8_encode", dst, 0xD800) == 0
+    assert fx.call("nota_utf8_encode", dst, 0x110000) == 0
+
+
+@test
+def test_utf8_len(fx):
+    for s, want in [("", 0), ("abc", 3), ("\u00e9\u00e8", 2),
+                    ("a\u20acb", 3), ("\U0001F600\U0001F601", 2)]:
+        b = s.encode()
+        addr = fx.cstr(b)
+        got = fx.call("nota_utf8_len", addr, len(b))
+        assert got == want, f"utf8_len({s!r}) = {got}, want {want}"
+
+
+@test
+def test_utf8_next_prev(fx):
+    b = "a\u00e9\u20ac\U0001F600".encode()
+    addr = fx.cstr(b)
+    stops = [0, 1, 3, 6]
+    off = 0
+    for want in stops[1:]:
+        off = fx.call("nota_utf8_next", addr, len(b), off)
+        assert off == want, f"next -> {off}, want {want}"
+    for want in reversed(stops[:-1]):
+        off = fx.call("nota_utf8_prev", addr, off)
+        assert off == want, f"prev -> {off}, want {want}"
+
+
+@test
+def test_utf8_cp_byte_mapping(fx):
+    b = "a\u00e9\u20ac\U0001F600z".encode()
+    addr = fx.cstr(b)
+    for cp, byte in [(0, 0), (1, 1), (2, 3), (3, 6), (4, 10), (5, 11)]:
+        got = fx.call("nota_utf8_cp_to_byte", addr, len(b), cp)
+        assert got == byte, f"cp_to_byte({cp}) = {got}, want {byte}"
+    for byte, cp in [(0, 0), (1, 1), (2, 1), (3, 2), (6, 3), (11, 5)]:
+        got = fx.call("nota_utf8_byte_to_cp", addr, byte)
+        assert got == cp, f"byte_to_cp({byte}) = {got}, want {cp}"
+
+
+@test
+def test_utf8_valid(fx):
+    good = ["", "plain ascii", "caf\u00e9", "\u20ac\U0001F600"]
+    for s in good:
+        b = s.encode()
+        assert fx.call("nota_utf8_valid", fx.cstr(b), len(b)) == 1, repr(s)
+    bad = [b"\xc0\x80", b"\xed\xa0\x80", b"\xf5\x80", b"abc\x80"]
+    for b in bad:
+        addr = fx.alloc(len(b) + 1)
+        import struct
+        fx.m.store_mem(addr, b + b"\0")
+        assert fx.call("nota_utf8_valid", addr, len(b)) == 0, b
+
+
+@test
+def test_sys_strcpy_strcat(fx):
+    dst = fx.alloc(64)
+    src = fx.cstr("first")
+    assert fx.call("nota_strcpy", dst, src) == dst
+    assert fx.read_cstr(dst) == b"first"
+    assert fx.call("nota_strcat", dst, fx.cstr("-second")) == dst
+    assert fx.read_cstr(dst) == b"first-second"
+
+
+@test
+def test_sys_strlcat_bounds(fx):
+    dst = fx.alloc(10)
+    fx.m.store_mem(dst, b"ab\0" + b"\xcc" * 7)
+    n = fx.call("nota_strlcat", dst, fx.cstr("cdefghij"), 5)
+    assert fx.read_cstr(dst) == b"abcd", fx.read_cstr(dst)
+    assert n == 4, n
+    # already-full buffer reports the capacity, like BSD strlcat
+    dst2 = fx.alloc(8)
+    fx.m.store_mem(dst2, b"abcdefgh")
+    assert fx.call("nota_strlcat", dst2, fx.cstr("x"), 8) == 8
+
+
+@test
+def test_sys_strchr_strrchr(fx):
+    s = fx.cstr("a/b/c")
+    assert fx.call("nota_strchr", s, ord("/")) == s + 1
+    assert fx.call("nota_strrchr", s, ord("/")) == s + 3
+    assert fx.call("nota_strchr", s, ord("z")) == 0
+    assert fx.call("nota_strrchr", s, 0) == s + 5
+
+
+@test
+def test_sys_itoa_utoa(fx):
+    buf = fx.alloc(32)
+    for v, want in [(0, b"0"), (7, b"7"), (42, b"42"), (1000, b"1000"),
+                    (2**64 - 1, b"18446744073709551615")]:
+        n = fx.call("nota_utoa", buf, v)
+        assert fx.read(buf, n) == want, (v, fx.read(buf, n))
+    for v, want in [(-1, b"-1"), (-42, b"-42"), (9, b"9"),
+                    (2**63 - 1, b"9223372036854775807")]:
+        n = fx.call("nota_itoa", buf, v & 0xFFFFFFFFFFFFFFFF)
+        assert fx.read(buf, n) == want, (v, fx.read(buf, n))
+
+
+@test
+def test_sys_crc32(fx):
+    # CRC-32/ISO-HDLC check value for "123456789"
+    data = fx.cstr("123456789")
+    assert fx.call("nota_crc32", data, 9, 0) == 0xCBF43926
+    assert fx.call("nota_crc32", data, 0, 0) == 0
+    # incremental use: crc(a+b) == crc(b, seed=crc(a))
+    a = fx.cstr("1234")
+    b = fx.cstr("56789")
+    seed = fx.call("nota_crc32", a, 4, 0)
+    assert fx.call("nota_crc32", b, 5, seed) == 0xCBF43926
+
+
+@test
+def test_sys_monotonic_ms(fx):
+    import sysemu
+    k = sysemu.Kernel()
+    k.now_ms = 123456
+    fx.m.syscall = k
+    got = fx.call("nota_monotonic_ms")
+    assert got == 123456, got
+    k.now_ms += 1500
+    assert fx.call("nota_monotonic_ms") == 124956
+
+
+@test
+def test_sys_sleep_ms(fx):
+    import sysemu
+    k = sysemu.Kernel()
+    fx.m.syscall = k
+    start = k.now_ms
+    fx.call("nota_sleep_ms", 250)
+    assert k.now_ms - start == 250, k.now_ms - start
+
+
+@test
+def test_sys_write_read_file(fx):
+    import sysemu
+    k = sysemu.Kernel()
+    fx.m.syscall = k
+    buf = fx.alloc(1024)
+    payload = b"hello store" * 40
+    taddr = fx.cstr("/data/nota/a.tmp")
+    faddr = fx.cstr("/data/nota/a.dat")
+    n = s32(fx.call("nota_write_file_sync", taddr, faddr, fx.cstr(payload),
+                    len(payload)))
+    assert n == len(payload), n
+    assert k.files["/data/nota/a.dat"] == payload
+    assert "/data/nota/a.tmp" not in k.files, "tmp file must be renamed away"
+    got = s32(fx.call("nota_read_file", faddr, buf, 1024))
+    assert got == len(payload), got
+    assert fx.read(buf, got) == payload
+
+
+@test
+def test_sys_write_file_sync_failure_keeps_old(fx):
+    """A write failure must leave the previous file intact (crash safety)."""
+    import sysemu
+    k = sysemu.Kernel()
+    k.files["/data/nota/a.dat"] = bytearray(b"OLD CONTENT")
+    fx.m.syscall = k
+    taddr = fx.cstr("/data/nota/a.tmp")
+    faddr = fx.cstr("/data/nota/a.dat")
+    k.write_allowed = 0            # every write fails
+    n = s32(fx.call("nota_write_file_sync", taddr, faddr, fx.cstr(b"NEW"), 3))
+    assert n < 0, n
+    assert k.files["/data/nota/a.dat"] == b"OLD CONTENT"
 
 
 # --------------------------------------------------------------- runner -----
