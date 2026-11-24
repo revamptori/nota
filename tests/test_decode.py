@@ -109,6 +109,72 @@ CASES = [
     ("tbnz", "mov x0, #-1\n tbnz x0, #63, 1f\n movz x0, #0\n1: ret", {},
      0xFFFFFFFFFFFFFFFF),
     ("blr", "movz x1, #3\n 1: blr x2\n ret\n 2:", {}, None),
+    # Register-offset loads: the S bit scales the index by the access size.
+    # Without it a table walk of 8-byte entries reads a byte-shifted alias of
+    # the previous slot, which is far more confusing than a clean fault.
+    ("ldr reg-offset lsl #3",
+     "mov x1, #0x1E0000\n movz x2, #3\n movz x3, #0x55\n"
+     " stp xzr, x3, [x1, #16]\n ldr x0, [x1, x2, lsl #3]\n ret", {},
+     0x55),
+    ("ldr reg-offset lsl #3 slot0",
+     "mov x1, #0x1E0000\n movz x3, #0x7\n movz x4, #0x8\n"
+     " stp x3, x4, [x1]\n ldr x0, [x1, xzr, lsl #3]\n ret", {}, 0x7),
+    ("ldr reg-offset no shift",
+     "mov x1, #0x1E0000\n movz x2, #8\n movz x3, #0x8\n movz x4, #0x9\n"
+     " stp x3, x4, [x1]\n ldr x0, [x1, x2]\n ret", {}, 0x9),
+    ("ldr w reg-offset lsl #2",
+     "mov x1, #0x1E0000\n movz x2, #1\n movz x3, #0x11\n movk x3, #0x22, lsl #16\n"
+     " stp w3, w3, [x1, #4]\n ldr w0, [x1, x2, lsl #2]\n ret", {},
+     0x220011),
+    ("str reg-offset lsl #3",
+     "mov x1, #0x1E0000\n movz x2, #1\n movz x0, #0x2a\n"
+     " str x0, [x1, x2, lsl #3]\n ldr x0, [x1, #8]\n ret", {}, 0x2a),
+    ("ldrb reg-offset lsl #0",
+     "mov x1, #0x1E0000\n movz x2, #1\n movz x3, #0x5a5a\n"
+     " str x3, [x1]\n ldrb w0, [x1, x2]\n ret", {}, 0x5a),
+    # Scalar FP stores: the writeback mode lives in bits 11:10, not bit 24.
+    # Reading it off bit 24 made every `str s0, [x14], #4` a plain store, so a
+    # vertex cursor never advanced and six vertices overwrote one another.
+    # FP arithmetic opcodes are NOT in intuitive order: bits 15:12 give
+    # 0 FMUL, 1 FDIV, 2 FADD, 3 FSUB. Assuming FADD=0 makes fdiv a subtract.
+    ("fadd", "mov w0, #3\n scvtf s0, w0\n mov w1, #2\n scvtf s1, w1\n"
+             " fadd s2, s0, s1\n fcvtas w0, s2\n ret", {}, 5),
+    ("fsub", "mov w0, #3\n scvtf s0, w0\n mov w1, #2\n scvtf s1, w1\n"
+             " fsub s2, s0, s1\n fcvtas w0, s2\n ret", {}, 1),
+    ("fmul", "mov w0, #3\n scvtf s0, w0\n mov w1, #2\n scvtf s1, w1\n"
+             " fmul s2, s0, s1\n fcvtas w0, s2\n ret", {}, 6),
+    ("fdiv", "mov w0, #12\n scvtf s0, w0\n mov w1, #3\n scvtf s1, w1\n"
+             " fdiv s2, s0, s1\n fcvtas w0, s2\n ret", {}, 4),
+    ("fdiv then fadd chain",
+     "mov w0, #255\n scvtf s7, w0\n mov w1, #34\n scvtf s0, w1\n"
+     " fdiv s0, s0, s7\n mov w2, #255\n scvtf s1, w2\n fmul s0, s0, s1\n"
+     " fcvtas w0, s0\n ret", {}, 34),
+    ("fmov 32-bit both ways",
+     "mov w0, #0x4048\n movk w0, #0x3f80, lsl #16\n fmov s0, w0\n"
+     " fmov w1, s0\n mov w0, w1\n ret", {}, 0x3F804048),
+    ("str s post-index advances",
+     "mov x1, #0x1E0000\n mov w0, #0x3f800000\n"
+     " fmov s0, w0\n str s0, [x1], #4\n mov x0, x1\n ret", {},
+     0x1E0004),
+    ("str s post-index writes",
+     "mov x1, #0x1E0000\n mov w0, #0x3f800000\n"
+     " fmov s0, w0\n str s0, [x1], #4\n ldr w0, [x1, #-4]\n ret", {},
+     0x3f800000),
+    ("str s unsigned offset no writeback",
+     "mov x1, #0x1E0000\n mov w0, #0x40000000\n"
+     " fmov s0, w0\n str s0, [x1, #8]\n ldr w0, [x1, #8]\n ret", {},
+     0x40000000),
+    ("ldr s post-index",
+     "mov x1, #0x1E0000\n mov w0, #0x40400000\n"
+     " fmov s0, w0\n str s0, [x1]\n ldr s1, [x1], #4\n mov x0, x1\n ret", {},
+     0x1E0004),
+    ("str d post-index",
+     "mov x1, #0x1E0000\n mov w0, #0x3ff00000\n"
+     " fmov s0, w0\n str d0, [x1], #8\n mov x0, x1\n ret", {},
+     0x1E0008),
+    ("ldrb reg-offset last byte",
+     "mov x1, #0x1E0000\n movz x2, #2\n movz x3, #0x5a41\n"
+     " str x3, [x1]\n ldrb w0, [x1, x2]\n ret", {}, 0x00),
 ]
 
 

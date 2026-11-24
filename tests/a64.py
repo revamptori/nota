@@ -24,6 +24,7 @@ touches unsupported code fails loudly rather than silently.
 The interpreter is *only* used on the host; the APK runs the same bytes on a
 real ARM64 core.
 """
+import math
 import struct
 
 MASK64 = (1 << 64) - 1
@@ -46,6 +47,11 @@ def sx(v, bits):
 class Machine:
     def __init__(self, mem_size=(1 << 24)):
         self.x = [0] * 32
+        # 32 SIMD/FP registers, kept as raw 128-bit ints so single- and
+        # double-precision values can share the file. The renderer only uses
+        # scalar singles, but storing raw bits means a stp of the q registers
+        # would not have to know that.
+        self.q = [0] * 32
         self.sp = 0
         self.n = False
         self.z = False
@@ -111,6 +117,24 @@ class Machine:
                 self.sp = v
         else:
             self.x[i] = v
+
+    def getq(self, i):
+        return self.q[i]
+
+    def setq(self, i, v):
+        self.q[i] = v & ((1 << 128) - 1)
+
+    def gets(self, i):
+        """A single-precision register as a Python float."""
+        return struct.unpack("<f", struct.pack("<I", self.q[i] & 0xFFFFFFFF))[0]
+
+    def sets(self, i, v):
+        """Store a Python float, quietly normalising NaN/inf like the FPU."""
+        try:
+            bits = struct.unpack("<I", struct.pack("<f", v))[0]
+        except OverflowError:
+            bits = 0x7F800000 if v > 0 else 0xFF800000
+        self.q[i] = (self.q[i] & ~0xFFFFFFFF) | bits
 
     def write_cstr(self, addr, s):
         self.store_mem(addr, s.encode() + b"\x00")
@@ -254,7 +278,12 @@ class Machine:
             return self.ldr_literal(insn, pc)
 
         # ---- PC-relative ----
-        if (insn & 0x1F000000) == 0x10000000 and not ((insn>>31)&1):  # adr/adrp
+        # ADR  : op=0, immlo(31:30) immhi(23:5) Rd(4:0)  -> byte displacement
+        # ADRP : op=1, same fields                        -> page displacement
+        # The op bit is 31, so it cannot be masked out before being tested;
+        # masking it away first made ADRP a displacement instruction with the
+        # wrong shift, i.e. a plausible-looking wrong address.
+        if (insn & 0x1F000000) == 0x10000000:            # adr/adrp
             imm = ((insn >> 5) & 0x7FFFF) << 2 | ((insn >> 29) & 3)
             imm = sx(imm, 21)
             if (insn >> 31) & 1:
@@ -340,6 +369,179 @@ class Machine:
             prod = self.get(rn) * self.get(rm)
             acc = self.get(ra)
             self.set(rd, (acc - prod) if op else (acc + prod))
+            return pc + 4
+
+
+        # ---- scalar FP: conversion and arithmetic ----
+        # The renderer only needs single precision, so this covers exactly the
+        # operations src/tex.S and src/ui.S emit. Anything else stays
+        # unsupported, which is the point: an unexercised instruction should
+        # fail loudly rather than be modelled approximately.
+        # Bit 21 is set for the whole scalar FP group. Within it, the two
+        # families are told apart by bit 11: the arithmetic forms
+        # (FMUL/FDIV/FADD/FSUB, and F*MADD which is not used here) have it
+        # set, the conversion forms (SCVTF/UCVTF/FCVT*) do not. Splitting on
+        # anything else - bit 12, or the 5-bit field at 16 - conflates the
+        # two, which is how a first attempt produced silently zero results.
+        # ---- FMOV between a general register and an FP register ----
+        # `fmov wD, sN` / `fmov sD, wN` (sf=0) and the 64-bit pair (sf=1)
+        # move bits, not values. The direction is bit 16 (part of the rmode
+        # field): set is GP->FP (0x1E27..), clear is FP->GP (0x1E26..). The
+        # mask must not include bits 15:10, which is where the two encodings
+        # differ. Without this
+        # a store of a constant float had to go through memory, which is
+        # exactly the sort of detour that lets a decoder bug hide.
+        # FMOV must be tested before the conversion family, but it also has to
+        # be *narrow*: bits 15:10 are zero in both FMOV forms and non-zero for
+        # SCVTF/FMUL, which share the same upper bits. A guard that ignored
+        # them swallowed `scvtf s0, w0` and every int-to-float conversion
+        # silently returned zero.
+        # ftype (bits 23:22) is 0 for single and 1 for double, so it has to be
+        # masked out; the other discriminators are bits 20:16 (6 = FP->GP,
+        # 7 = GP->FP) and bits 15:10, which are zero in both FMOV forms.
+        if ((insn & 0x7F200000) == 0x1E200000
+                and ((insn >> 16) & 0x1F) in (6, 7)
+                and ((insn >> 10) & 0x3F) == 0):
+            sf = (insn >> 31) & 1
+            rn_i = (insn >> 5) & 0x1F
+            rd = insn & 0x1F
+            width = 64 if sf else 32
+            if ((insn >> 16) & 0x1F) == 7:             # GP -> FP
+                v = self.get(rn_i) & ((1 << width) - 1)
+                if sf:
+                    self.setq(rd, v)               # fmov dD, xN replaces all 64
+                else:
+                    self.setq(rd, (self.q[rd] & ~0xFFFFFFFF) | v)
+            else:                                      # FP -> GP (zero-extends)
+                self.set(rd, self.getq(rn_i) & ((1 << width) - 1))
+            return pc + 4
+
+        if (insn & 0x5F200000) == 0x1E200000 and ((insn >> 21) & 1):
+            ftype = (insn >> 22) & 3
+            single = ftype == 0
+            rn_i = (insn >> 5) & 0x1F
+            rm_i = (insn >> 16) & 0x1F
+
+            def freg(i):
+                if single:
+                    return self.gets(i)
+                return struct.unpack("<d", struct.pack("<Q", self.getq(i)))[0]
+
+            def fset(i, v):
+                if single:
+                    self.sets(i, v)
+                else:
+                    self.setq(i, struct.unpack("<Q", struct.pack("<d", v))[0])
+
+            if (insn >> 11) & 1:
+                # ---- arithmetic: Rm is a register ----
+                a, b = freg(rn_i), freg(rm_i)
+                # opcode is bits 15:12, verified against the assembler:
+                #   0 FMUL, 1 FDIV, 2 FADD, 3 FSUB
+                # (The intuitive FADD=0 ordering is wrong, and getting it wrong
+                # turns a divide into a subtract - which produces a plausible
+                # number rather than a fault.)
+                op = (insn >> 12) & 0xF
+                if op == 2:
+                    r = a + b
+                elif op == 3:
+                    r = a - b
+                elif op == 0:
+                    r = a * b
+                elif op == 1:
+                    if b == 0:
+                        r = (math.inf if a > 0 else
+                             -math.inf if a < 0 else math.nan)
+                    else:
+                        r = a / b
+                else:
+                    raise IllegalInstruction(
+                        f"unsupported FP arithmetic {insn:#010x} at {pc:#x}")
+                fset(rd, r)
+                return pc + 4
+
+            # ---- conversion ----
+            # The operation is bits 18:16 (3 bits); bits 20:19 are rmode and
+            # must not be folded in. `scvtf s7, w7` is 0x1E2908E7: opcode 1
+            # with rmode 1, so a 5-bit read at 20:16 yields 9 and matches
+            # nothing, which is how every int-to-float conversion silently
+            # produced zero.
+            opcode = (insn >> 16) & 7
+            rmode = (insn >> 19) & 3
+            if opcode in (2, 3):                     # SCVTF / UCVTF
+                sf = (insn >> 31) & 1
+                raw = self.get(rn_i)
+                if not sf:
+                    raw &= 0xFFFFFFFF
+                if opcode == 2:                      # signed
+                    if sf and raw >= (1 << 63):
+                        raw -= 1 << 64
+                    elif not sf and raw >= (1 << 31):
+                        raw -= 1 << 32
+                fset(rd, float(raw))
+                return pc + 4
+            if opcode in (0, 1, 4, 5):               # FCVTN*/FCVTA*/FCVTZ*
+                v = freg(rn_i)
+                if opcode in (0, 1):                 # FCVTNS / FCVTNU round-to-nearest
+                    r = math.floor(v + 0.5) if v >= 0 else math.ceil(v - 0.5)
+                elif opcode in (4, 5):               # FCVTAS / FCVTAU
+                    r = math.floor(v + 0.5) if v >= 0 else math.ceil(v - 0.5)
+                else:                                # FCVTZS / FCVTZU truncate
+                    r = math.trunc(v)
+                sf = (insn >> 31) & 1
+                if opcode in (1, 5) and r < 0:       # unsigned forms
+                    r &= (1 << (64 if sf else 32)) - 1
+                self.set(rd, r)
+                return pc + 4
+
+            raise IllegalInstruction(
+                f"unsupported FP conversion {insn:#010x} at {pc:#x}")
+
+
+        # ---- scalar FP load/store (stur/ldur/str/ldr s/d) ----
+        # Same addressing forms as the general-purpose versions, but bit 26
+        # selects the SIMD&FP register file.
+        # bit 24 distinguishes the unsigned-offset form (no writeback) from
+        # the imm9 forms, exactly as for the integer load/store group.
+        # 0x3C.. is post-index/pre-index/unscaled, 0x3D.. is unsigned offset
+        if (insn & 0x3E000000) == 0x3C000000:
+            size = (insn >> 30) & 3          # 0 = 8-bit, 2 = 32-bit, 3 = 64
+            opc = (insn >> 22) & 3
+            is_load = bool(opc & 1)
+            # bits 25:24 == 01 is the unsigned-offset form; the imm9 forms are
+            # bits 25:24 == 00 and select unscaled / post / unprivileged / pre
+            # with bits 11:10. Testing bit 24 alone made every post-index
+            # `str s0, [x14], #4` a no-writeback store, so a vertex-buffer
+            # cursor never advanced and all six vertices landed on top of
+            # each other.
+            unsigned = ((insn >> 24) & 3) == 1
+            if unsigned:
+                # imm12 is scaled by the access size, as for the integer
+                # forms: `ldr s0,[x9,#0x40]` carries 0x10, and the hardware
+                # multiplies by 4. Verified against the assembler.
+                imm9 = ((insn >> 10) & 0xFFF) * (4 if size == 2 else 8)
+                mode = 2                     # no writeback
+            else:
+                imm9 = sx((insn >> 12) & 0x1FF, 9)
+                mode = (insn >> 10) & 3      # 0 unscaled, 1 post, 3 pre
+            rn_i = (insn >> 5) & 0x1F
+            rt = insn & 0x1F
+            base = self.get(rn_i, is_sp=True)
+            addr = base if mode == 1 else base + imm9
+            nbytes = 4 if size == 2 else 8
+            if is_load:
+                raw = int.from_bytes(self.load_mem(addr, nbytes), "little")
+                if size == 2:
+                    self.setq(rt, (self.q[rt] & ~0xFFFFFFFF) | raw)
+                else:
+                    self.setq(rt, raw)
+            else:
+                bits = self.q[rt] & ((1 << (nbytes * 8)) - 1)
+                self.store_mem(addr, bits.to_bytes(nbytes, "little"))
+            if mode == 1:
+                self.set(rn_i, base + imm9, is_sp=True)
+            elif mode == 3:
+                self.set(rn_i, base + imm9, is_sp=True)
             return pc + 4
 
         # ---- nop / hints ----
@@ -459,11 +661,27 @@ class Machine:
         rn = (insn >> 5) & 0x1F
         rt = insn & 0x1F
         rm = (insn >> 16) & 0x1F
-        opt = (insn >> 13) & 3
-        s = (insn >> 12) & 1
+        # option (15:13) and S (12) scale/expand the index register. Ignoring
+        # them makes every `ldr xN, [xBase, xIdx, lsl #3]` read from xBase +
+        # xIdx, i.e. a byte-shifted alias of the intended slot - which is how a
+        # pointer read out of a table of 8-byte entries came back shifted by
+        # one byte.
+        opt = (insn >> 13) & 7
+        s_bit = (insn >> 12) & 1
         base = self.get(rn, is_sp=True)
         idx = self.get(rm)
-        addr = base + idx
+        if opt == 0b010:                 # UXTW
+            idx &= 0xFFFFFFFF
+        elif opt == 0b011:               # LSL (64-bit index)
+            pass
+        elif opt == 0b110:               # SXTW
+            idx = sx(idx, 32)
+        elif opt == 0b111:               # SXTX
+            idx = sx(idx, 64)
+        else:
+            raise IllegalInstruction(f"ldst reg option {opt:#b}")
+        idx = (idx << (size if s_bit else 0)) & MASK64
+        addr = (base + idx) & MASK64
         width = 1 << size
         if opc & 1:
             raw = int.from_bytes(self.load_mem(addr, width), "little")

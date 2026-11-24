@@ -451,6 +451,35 @@ nota_strrchr:
     ret
     .size nota_strrchr, . - nota_strrchr
 
+
+/* long nota_now_ms(void) - wall clock in milliseconds.
+ * Used for note timestamps and for double-tap detection. A clock that cannot
+ * be read is not worth failing over: return 0 and let callers treat every
+ * event as independent. */
+    .globl nota_now_ms
+    .type  nota_now_ms, %function
+nota_now_ms:
+    stp    x29, x30, [sp, #-32]!
+    mov    x29, sp
+    /* struct timespec on the stack: 16 bytes, tv_sec then tv_nsec */
+    mov    w0, #1               /* CLOCK_MONOTONIC */
+    add    x1, sp, #16
+    bl     nota_clock_gettime
+    tbnz   x0, #63, .Lnm_zero
+    ldp    x9, x10, [sp, #16]   /* sec, nsec */
+    mov    w11, #1000
+    movz   x12, #(1000000 & 0xFFFF)
+    movk   x12, #(1000000 >> 16), lsl #16
+    sdiv   x10, x10, x12        /* nsec -> ms */
+    madd   x0, x9, x11, x10
+    b      .Lnm_out
+.Lnm_zero:
+    mov    x0, #0
+.Lnm_out:
+    ldp    x29, x30, [sp], #32
+    ret
+    .size nota_now_ms, . - nota_now_ms
+
 /* long nota_utoa(char *dst, unsigned long v) - returns bytes written. */
     .globl nota_utoa
     .type  nota_utoa, %function
