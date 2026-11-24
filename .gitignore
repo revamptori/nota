@@ -5,6 +5,7 @@ dist/
 *.o
 *.a
 *.so
+# One exception below: the published build.
 *.apk
 *.apk.idsig
 *.dex
@@ -20,3 +21,9 @@ __pycache__/
 *.keystore
 *.p12
 local.properties
+
+# The published build is committed so it can be downloaded straight from the
+# repository. Build outputs are otherwise never tracked; this single file is
+# the deliberate exception, and `python3 build.py` reproduces it byte-for-byte
+# from a clean checkout.
+!nota-1.0.0.apk

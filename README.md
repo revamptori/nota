@@ -22,6 +22,21 @@ The screenshot is not a mock-up: it is painted from the quads the real
 - **Rendering** — one GL ES 2 program, a baked 200-glyph font atlas, batched
   coloured quads. No text-shaping library, no FreeType, no fonts at runtime.
 
+## Install the prebuilt APK
+
+`nota-1.0.0.apk` in the repository root is a built copy of this source
+(146 KB, arm64-v8a):
+
+```sh
+adb install nota-1.0.0.apk
+```
+
+It is **debug-signed** and targets arm64 only, so it installs on a real 64-bit
+ARM device over adb but not on an x86_64 emulator, and it is not Play Store
+distributable. A release build needs a private keystore
+(`build.py --key … --cert …`). Verify the download against
+`nota-1.0.0.apk.sha256`.
+
 ## Build
 
 Requires Python 3 and a cross-compiler that targets `aarch64-linux-android`.
