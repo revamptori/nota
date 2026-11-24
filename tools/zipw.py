@@ -47,14 +47,17 @@ def build(entries, comment=b""):
         body = e.compressed()
         crc = zlib.crc32(e.data) & 0xFFFFFFFF
         extra = b""
-        # Local header: 30 bytes + name + extra, then data.
-        base = len(out) + 30 + len(name)
+        # Local header: 30 bytes + name + extra, then data. An extra field is
+        # itself 4 bytes of header plus payload, so whatever padding is chosen
+        # has to leave the data at a multiple of `align` *after* the field is
+        # included - hence solving for the total, not for the payload.
         if e.align > 1:
+            base = len(out) + 30 + len(name)
             pad = (-base) % e.align
-            # Extra field: header id 0xd935 (as used by zipalign), size, pad
+            if 0 < pad < 4:
+                # a 4-byte field cannot hold fewer than 4 bytes of header
+                pad += e.align
             if pad:
-                if pad < 4:
-                    pad += e.align
                 extra = struct.pack("<HH", 0xD935, pad - 4) + b"\x00" * (pad - 4)
         flags = 0
         ver = 20

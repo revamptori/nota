@@ -297,4 +297,38 @@
 #define GL_FRAMEBUFFER   0x8D40
 #define GL_TEXTURE_SWIZZLE_RGBA 0x8E46
 
+/* ------------------------------------------------- renderer state block ----
+ * One static struct holds what the renderer needs between frames, so init
+ * resolves each name once (glGetAttribLocation is a string lookup) and the
+ * per-frame path is arithmetic only.
+ */
+#define GL_W          0x00   /* long: surface width in pixels                */
+#define GL_H          0x08   /* long: surface height in pixels               */
+#define GL_PROG       0x10   /* unsigned: program object                     */
+#define GL_TEX        0x18   /* unsigned: atlas texture                      */
+#define GL_VBO        0x20   /* unsigned: vertex buffer                      */
+#define GL_NVERTS     0x28   /* unsigned: vertices queued this frame         */
+#define GL_A_POS      0x2C   /* int: attribute locations                     */
+#define GL_A_UV       0x30
+#define GL_A_COL      0x34
+#define GL_U_PROJ     0x38   /* int: uniform locations                       */
+#define GL_U_TEX      0x3C
+#define GL_CR         0x40   /* float: current colour, straight alpha        */
+#define GL_CG         0x44
+#define GL_CB         0x48
+#define GL_CA         0x4C
+#define GL_PROJ_W     0x50   /* float: viewport width, for u_proj            */
+#define GL_PROJ_H     0x54   /* float: viewport height                       */
+#define GL_STATE_SIZE 0x58
+
+#define GL_MAX_VERTS  4096
+/* x, y, u, v, r, g, b, a - eight float32 per vertex. The attribute
+ * strides below are expressed in floats (glVertexAttribPointer takes a byte
+ * stride, which is this * 4), so this must stay in step with the eight stores
+ * nota_gl_quad makes per vertex. */
+#define GL_VSTRIDE    32
+#define GL_LUMINANCE_ALPHA 0x190A
+#define GL_ALPHA           0x1906
+#define GL_COLOR_BUFFER_BIT 0x4000
+
 #endif /* NOTA_H */

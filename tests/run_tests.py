@@ -8,6 +8,7 @@ wrong fails here.
 Usage:  python3 tests/run_tests.py [-v] [test_name ...]
 """
 import os
+import struct
 import subprocess
 import sys
 import traceback
@@ -22,7 +23,34 @@ from elftools.elf.elffile import ELFFile                # noqa: E402
 CC = os.environ.get("NOTA_CC", "zig cc -target aarch64-linux-android").split()
 BUILD = os.path.join(ROOT, "build", "tests")
 
-SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S", "src/edit.S", "src/store.S"]          # flat-testable modules (no bionic calls)
+SOURCES = ["src/libc.S", "src/utf8.S", "src/sys.S", "src/edit.S", "src/store.S"]
+
+# store.S's collection-level save/load needs the block from src/app.S, but
+# linking app.S here would pull in the full 32 MiB note arena and blow past the
+# interpreter's mapping. The unit tests exercise the per-record code, so tiny
+# stand-ins are enough; test_ui.py links the real app.S and covers the rest.
+STUBS = """
+    .bss
+    .p2align 4
+    .globl nota_store
+    .hidden nota_store
+nota_store:
+    .space 0x40
+    .globl nota_notes
+    .hidden nota_notes
+nota_notes:
+    .space 0x8000
+    .globl nota_arena
+    .hidden nota_arena
+nota_arena:
+    .space 0x10000
+    .globl nota_as
+    .hidden nota_as
+nota_as:
+    .space 0x60
+    .text
+    .section .note.GNU-stack,"",%progbits
+"""
 TESTS = []
 
 
@@ -43,7 +71,15 @@ class Fixture:
         self.elf = elf
         self.syms = syms
         self.m = Machine()
-        self.m.map(0x100000, 0xFF000)
+        # Size the image mapping from the ELF rather than a fixed 0xFF000:
+        # store.S carries an 8 MiB save buffer in .bss, and a hardcoded map
+        # made the fixture fail at load time with an unhelpful unmapped write.
+        bss_end = 0x100000 + 0x100000
+        with open(elf, "rb") as fh:
+            for sec in ELFFile(fh).iter_sections():
+                if sec["sh_flags"] & 2 and sec["sh_addr"]:
+                    bss_end = max(bss_end, sec["sh_addr"] + sec["sh_size"])
+        self.m.map(0x100000, ((bss_end - 0x100000) + 0xFFF) & ~0xFFF)
         self.m.map(0x1000000, 0x800000)   # heap/data
         self.m.map(0x1800000, 0x800000)   # strings
         self.m.map(self.m.sentinel & ~0xFFF, 0x1000)
@@ -104,6 +140,13 @@ def build():
                              "-o", obj, os.path.join(ROOT, src)],
                        check=True, capture_output=True, text=True)
         objs.append(obj)
+    stub = os.path.join(BUILD, "stubs.S")
+    with open(stub, "w") as fh:
+        fh.write(STUBS)
+    stubobj = os.path.join(BUILD, "stubs.o")
+    subprocess.run(CC + ["-c", "-fPIC", "-nostdlib", "-o", stubobj, stub],
+                   check=True, capture_output=True)
+    objs.append(stubobj)
     sobj = os.path.join(BUILD, "startup.o")
     subprocess.run(CC + ["-c", "-fPIC", "-nostdlib", f"-I{ROOT}/src",
                          "-o", sobj, startup], check=True)
@@ -896,8 +939,10 @@ def test_store_note_roundtrip(fx):
     # decode into a fresh note
     out = fx.alloc(NOTE_SIZE)
     arena = fx.alloc(4096)
-    tags = fx.alloc(64)
-    fx.m.store_mem(out + NOTE_TAG_PTR, tags.to_bytes(8, "little"))
+    # NOTE_TAG_PTR is deliberately left unset. Decode must place the tag array
+    # in the arena it was given: the pointer stored on the note that was
+    # encoded belonged to a different process, so honouring it here would
+    # scatter copies to an arbitrary address.
     used = s32(fx.call("nota_note_decode", buf, size, out, arena, 4096))
     assert used == size, used
     got = Note.__new__(Note)
@@ -910,6 +955,8 @@ def test_store_note_roundtrip(fx):
     assert got.field(NOTE_UPDATED) == 2000
     assert got.title == b"My note"
     assert got.body == "body \u20ac text".encode()
+    tags = struct.unpack("<Q", fx.read(out + NOTE_TAG_PTR, 8))[0]
+    assert arena <= tags < arena + 4096, "tag array is not in the arena"
     assert fx.read(tags, 8) == (1).to_bytes(4, "little") + (4).to_bytes(4, "little")
 
 
