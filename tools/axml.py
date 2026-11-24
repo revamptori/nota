@@ -292,6 +292,14 @@ def compile_manifest(package="com.revamptori.nota", version_code=1,
             ("android", "name"): "android.app.lib_name",
             ("android", "value"): lib_name,
         }),
+        # Without this the activity exports fine but appears in no launcher:
+        # the app installs and then cannot be started by tapping an icon.
+        # ACTION_MAIN + CATEGORY_LAUNCHER is what puts it in the app drawer.
+        N("intent-filter", {}, [
+            N("action", {("android", "name"): "android.intent.action.MAIN"}),
+            N("category", {("android", "name"):
+                           "android.intent.category.LAUNCHER"}),
+        ]),
     ])
 
     root = N("manifest", {

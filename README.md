@@ -27,12 +27,16 @@ The screenshot is not a mock-up: it is painted from the quads the real
 `nota-1.0.0.apk` in the repository root is a built copy of this source
 (146 KB, arm64-v8a):
 
-```sh
-adb install nota-1.0.0.apk
-```
+**Without a computer:** open this repository on the phone, download
+`nota-1.0.0.apk`, and tap it. Android will ask you to allow installs from your
+browser or file manager the first time ("Install unknown apps") — that is the
+normal path for any app that does not come from the Play Store. It then appears
+in the app drawer as **NOTA**.
+
+**With adb:** `adb install nota-1.0.0.apk`.
 
 It is **debug-signed** and targets arm64 only, so it installs on a real 64-bit
-ARM device over adb but not on an x86_64 emulator, and it is not Play Store
+ARM phone or tablet, but not on an x86_64 emulator, and it is not Play Store
 distributable. A release build needs a private keystore
 (`build.py --key … --cert …`). Verify the download against
 `nota-1.0.0.apk.sha256`.
@@ -77,6 +81,7 @@ writing and re-reading files.
 python3 tests/run_tests.py    # libc, utf8, editing, store: 51
 python3 tests/test_decode.py  # instruction decoding: 48
 python3 tests/test_ui.py      # layout, text, screens, save/load: 40
+python3 tests/test_manifest.py  # launcher filter, exported, no permissions: 8
 python3 tools/checkabi.py     # static ABI checks over src/*.S
 python3 tools/shot.py         # re-render docs/screenshot.png
 ```
