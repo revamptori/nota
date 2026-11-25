@@ -22,24 +22,21 @@ The screenshot is not a mock-up: it is painted from the quads the real
 - **Rendering** — one GL ES 2 program, a baked 200-glyph font atlas, batched
   coloured quads. No text-shaping library, no FreeType, no fonts at runtime.
 
-## Install the prebuilt APK
+## Install
 
-`nota-1.0.0.apk` in the repository root is a built copy of this source
-(146 KB, arm64-v8a):
+Builds are published as **GitHub Releases**, not committed to the tree.
+Open the [releases page](../../releases) on your phone and download the `.apk`
+from the latest release, then tap it. Android will ask you to allow installs
+from your browser or file manager the first time ("Install unknown apps") —
+that is the normal path for any app that does not come from the Play Store. It
+then appears in the app drawer as **NOTA**.
 
-**Without a computer:** open this repository on the phone, download
-`nota-1.0.0.apk`, and tap it. Android will ask you to allow installs from your
-browser or file manager the first time ("Install unknown apps") — that is the
-normal path for any app that does not come from the Play Store. It then appears
-in the app drawer as **NOTA**.
+With adb: `adb install nota-1.0.0.apk`.
 
-**With adb:** `adb install nota-1.0.0.apk`.
-
-It is **debug-signed** and targets arm64 only, so it installs on a real 64-bit
-ARM phone or tablet, but not on an x86_64 emulator, and it is not Play Store
-distributable. A release build needs a private keystore
-(`build.py --key … --cert …`). Verify the download against
-`nota-1.0.0.apk.sha256`.
+The published APK is **debug-signed** and targets arm64 only, so it installs on
+a real 64-bit ARM phone or tablet, but not on an x86_64 emulator, and it is not
+Play Store distributable. A release build needs a private keystore
+(`build.py --key … --cert …`). Each release carries a `.sha256` file.
 
 ## Build
 

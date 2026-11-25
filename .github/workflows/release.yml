@@ -1,0 +1,109 @@
+name: release
+
+# Builds the APK and attaches it to a GitHub Release.
+#
+# This exists because release assets cannot be uploaded from an ordinary
+# restricted environment: the upload endpoint is a different host
+# (uploads.github.com) from the API, and it is commonly blocked by egress
+# filtering. GitHub's own runners are not subject to that restriction, so the
+# build runs here and attaches the artifact with the token's normal permissions.
+#
+# Trigger it by pushing a version tag:
+#     git tag v1.0.0 && git push origin v1.0.0
+# or run it by hand from the Actions tab, which attaches the APK to the
+# tag named in the "tag" input.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and attach the APK to"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write        # required to create a release and upload assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # zig is pip-installable, so no NDK or Android SDK is needed: the
+          # build only wants a cross-compiler for aarch64-linux-android.
+          pip install pyelftools cryptography ziglang
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "number=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Run test suites
+        run: |
+          export NOTA_CC="$(python -c 'import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),"zig"))') cc -target aarch64-linux-android"
+          echo "compiler: $NOTA_CC"
+          python tests/run_tests.py
+          python tests/test_decode.py
+          python tests/test_ui.py
+          python tests/test_manifest.py
+          python tests/test_resources.py
+          python tools/checkabi.py
+
+      - name: Build APK
+        run: |
+          export NOTA_CC="$(python -c 'import ziglang,os;print(os.path.join(os.path.dirname(ziglang.__file__),"zig"))') cc -target aarch64-linux-android"
+          python build.py --cc "$NOTA_CC"
+          # Name the artifact after the tag so the release is self-describing.
+          cp out/nota.apk "nota-${{ steps.v.outputs.number }}.apk"
+          cp out/debug-cert.pem nota-debug-cert.pem
+          sha256sum "nota-${{ steps.v.outputs.number }}.apk" > "nota-${{ steps.v.outputs.number }}.apk.sha256"
+          cat "nota-${{ steps.v.outputs.number }}.apk.sha256"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.v.outputs.tag }}
+          name: NOTA ${{ steps.v.outputs.number }}
+          draft: false
+          fail_on_unmatched_files: true
+          body: |
+            NOTA ${{ steps.v.outputs.number }} — a notes app for Android written
+            entirely in AArch64 assembly.
+
+            | File | What it is |
+            | --- | --- |
+            | `nota-${{ steps.v.outputs.number }}.apk` | the app, arm64-v8a |
+            | `nota-${{ steps.v.outputs.number }}.apk.sha256` | checksum |
+            | `nota-debug-cert.pem` | the signing certificate |
+
+            Install by downloading the APK on the phone and tapping it, then
+            allowing "Install unknown apps" when Android asks. It appears in the
+            app drawer as **NOTA**.
+
+            This build is **debug-signed** and **arm64 only**: it runs on a real
+            64-bit ARM device and not on an x86_64 emulator, and it needs a
+            private keystore before it can be published on the Play Store.
+
+            Every file in this release is built from the tagged commit by the
+            `release` workflow, which also runs all test suites first.
+          files: |
+            nota-${{ steps.v.outputs.number }}.apk
+            nota-${{ steps.v.outputs.number }}.apk.sha256
+            nota-debug-cert.pem
