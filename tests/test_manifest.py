@@ -249,6 +249,64 @@ def test_the_app_requests_no_permissions():
     assert not perms, [p[2] for p in perms]
 
 
+@test
+def test_attribute_names_index_into_the_resource_map():
+    """Every android: attribute name index must be a valid resmap index.
+
+    In binary XML an attribute's name field is an index into the string pool,
+    and the resource map supplies the framework attribute id for each of the
+    first N pool entries. If the attribute names are not the first N strings,
+    the parser reads an index past the end of the map and rejects the package -
+    which is what produces "There was a problem parsing the package".
+
+    The names were originally added after every tag and value string, putting
+    them at index 22+ with a 21-entry map.
+    """
+    data = axml.compile_manifest(debug=True, icon_res=0x7F020000)
+    _strings, resmap_len = _strings_and_resmap(data)
+    bad = []
+    off = 8
+    while off < len(data):
+        ctype, _hs, size = struct.unpack_from("<HHI", data, off)
+        if ctype == RES_XML_START_ELEMENT:
+            a_start, a_size, a_count = struct.unpack_from(
+                "<HHH", data, off + 24)
+            for k in range(a_count):
+                a = off + 16 + a_start + k * a_size
+                ns_i, name_i = struct.unpack_from("<II", data, a)
+                if ns_i != 0xFFFFFFFF and name_i >= resmap_len:
+                    bad.append((off, name_i))
+        off += size
+    assert resmap_len, "no resource map chunk"
+    assert not bad, f"attribute name indices outside the resmap: {bad}"
+
+
+@test
+def test_attribute_names_are_the_first_pool_entries():
+    """Stronger form of the above: pool[0..N-1] must be the attribute names."""
+    data = axml.compile_manifest(debug=True, icon_res=0x7F020000)
+    strings, resmap_len = _strings_and_resmap(data)
+    attrs = set(axml.ATTR_IDS)
+    first = strings[:resmap_len]
+    assert all(s in attrs for s in first), (
+        "the first pool entries are not all attribute names: %r" % (first,))
+    assert len(first) == resmap_len
+
+
+def _strings_and_resmap(data):
+    """-> (string pool entries, resource map length)."""
+    strings, resmap_len = [], None
+    off = 8
+    while off < len(data):
+        ctype, hsize, size = struct.unpack_from("<HHI", data, off)
+        if ctype == RES_STRING_POOL:
+            strings = _string_pool(data, off)
+        elif ctype == 0x0180:                    # RES_XML_RESOURCE_MAP
+            resmap_len = (size - hsize) // 4
+        off += size
+    return strings, resmap_len
+
+
 def main():
     verbose = "-v" in sys.argv
     only = [a for a in sys.argv[1:] if not a.startswith("-")]

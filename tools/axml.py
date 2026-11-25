@@ -146,14 +146,23 @@ class AXMLBuilder:
                 walk(k)
 
         walk(root)
-        for nm in order:
+        self.attr_order = order
+
+    def build(self, root, package=""):
+        self._collect(root)
+
+        # Resource-map entries correspond to string-pool indices, so the
+        # android: attribute names must occupy indices 0..N-1. They are added
+        # first, before any tag or value string. Adding them after the tags, as
+        # this did originally, put them at index 22+ while the resmap stayed
+        # 21 entries long: the parser then looked up an attribute name index
+        # past the end of the map and rejected the package.
+        for nm in self.attr_order:
             idx = self.pool.add(nm)
             assert idx == len(self.resmap), (nm, idx, len(self.resmap))
             self.resmap.append(ATTR_IDS[nm])
             self.attr_index[nm] = idx
 
-    def build(self, root, package=""):
-        self._collect(root)
         ns_prefix = self.pool.add("android")
         ns_uri = self.pool.add(ANDROID_NS)
         self.pool.add(package)

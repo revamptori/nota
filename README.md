@@ -81,7 +81,8 @@ writing and re-reading files.
 python3 tests/run_tests.py    # libc, utf8, editing, store: 51
 python3 tests/test_decode.py  # instruction decoding: 48
 python3 tests/test_ui.py      # layout, text, screens, save/load: 40
-python3 tests/test_manifest.py  # launcher filter, exported, no permissions: 8
+python3 tests/test_manifest.py  # launcher filter, attr indices, permissions: 10
+python3 tests/test_resources.py # resources.arsc chunk structure: 6
 python3 tools/checkabi.py     # static ABI checks over src/*.S
 python3 tools/shot.py         # re-render docs/screenshot.png
 ```
