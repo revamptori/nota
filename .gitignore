@@ -7,6 +7,9 @@ dist/
 *.so
 *.apk
 *.apk.idsig
+*.apk.sha256
+# signing material produced by build.py
+*.pem
 *.dex
 *.class
 # Local toolchains / venvs
