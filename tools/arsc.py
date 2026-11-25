@@ -129,11 +129,13 @@ def build_arsc(package_name="com.revamptori.nota", package_id=0x7F,
                 blob += b"\x00"
             offsets[idx] = len(blob)
             blob += data
-        # uint8 id, uint8 flags, uint16 reserved, uint32 entryCount,
-        # uint32 entriesStart
-        # ResTable_type: uint16 hdr, uint8 id, uint8 flags, uint32 reserved,
-        # uint32 entryCount, uint32 entriesStart, ResTable_config
-        header = struct.pack("<HBBII", header_size, tid, 0, count,
+        # chunk() already emitted {type, headerSize, size} - 8 bytes. What
+        # follows in ResTable_type is id, flags, reserved, entryCount,
+        # entriesStart, then the config. An earlier version began this with
+        # another uint16 header_size, which shifted every field by four bytes:
+        # the parser read headerSize (84) as the type id and the reserved word
+        # as the entry count, so the resource table was structurally invalid.
+        header = struct.pack("<BBHII", tid, 0, 0, count,
                              header_size + 4 * count) + default_config()
         entry_offsets = b"".join(struct.pack("<I", o) for o in offsets)
         return chunk(RES_TABLE_TYPE_TYPE, entry_offsets + bytes(blob),
